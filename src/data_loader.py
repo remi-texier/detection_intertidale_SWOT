@@ -3,50 +3,64 @@ import xarray as xr
 import numpy as np
 import pandas as pd
 import os
+import logging
 import re
 import h5py
 from typing import Dict, Any, Optional, Union
 
-def parse_tide_gauge_data(filepath: str) -> pd.DataFrame:
-    df = pd.read_csv(filepath, comment='#', delimiter=';', header=None, names=['DateTimeStr', 'Value', 'Source'], encoding='utf-8')
-    df = df.assign(DateTime=pd.to_datetime(df['DateTimeStr'], format='%d/%m/%Y %H:%M:%S'),
-                   Value=pd.to_numeric(df['Value'], errors='coerce'))
-    return df[['DateTime', 'Value']].dropna(subset=['Value']).copy()
+log = logging.getLogger("rich_app")
 
-def load_elevation_data(filepath: str, alt_var_name: str) -> xr.DataArray:
+def parse_tide_gauge_data(filepath: str) -> Optional[pd.DataFrame]: 
+    try:
+        df = pd.read_csv(filepath, comment='#', delimiter=';', header=None, names=['DateTimeStr', 'Value', 'Source'], encoding='utf-8') 
+        df = df.assign(DateTime=pd.to_datetime(df['DateTimeStr'], format='%d/%m/%Y %H:%M:%S'), 
+                       Value=pd.to_numeric(df['Value'], errors='coerce')) 
+        if df['DateTime'].dt.tz is not None: 
+            df['DateTime'] = df['DateTime'].dt.tz_localize(None) 
+        
+        clean_df = df[['DateTime', 'Value']].dropna(subset=['Value']).copy()
+        if clean_df.empty:
+            return None
+        return clean_df
+    except FileNotFoundError: 
+        return None
+    except Exception: 
+        return None
+
+def load_elevation_data(filepath: str, alt_var: str) -> xr.DataArray:
     with xr.open_dataset(filepath, decode_coords='all') as ds:
-        if alt_var_name not in ds:
-            raise ValueError(f"Altitude variable '{alt_var_name}' not found in {filepath}. Available: {list(ds.variables.keys())}")
-        elevation_da = ds[alt_var_name].copy()
+        if alt_var not in ds:
+            raise ValueError(f"Altitude variable '{alt_var}' not found in {filepath}. Available: {list(ds.variables.keys())}")
+        elev_da = ds[alt_var].copy()
     
-    has_rio = hasattr(elevation_da, 'rio')
+    has_rio = hasattr(elev_da, 'rio')
     crs_found = False
     if has_rio:
         try:
-            if elevation_da.rio.crs is not None:
+            if elev_da.rio.crs is not None:
                 crs_found = True
         except Exception:
             pass
             
     if not crs_found:
-        if 'lat' in elevation_da.coords and 'lon' in elevation_da.coords:
-            print(f"Warning (load_elevation_data): CRS not found via rioxarray in '{filepath}'. Assuming geographic (lat/lon).")
+        if 'lat' in elev_da.coords and 'lon' in elev_da.coords:
+            log.warning(f"CRS not found via rioxarray in '{filepath}'. Assuming geographic (lat/lon).")
         else:
-            print(f"Warning (load_elevation_data): CRS not found via rioxarray in '{filepath}' and standard lat/lon coords not detected.")
+            log.warning(f"CRS not found via rioxarray in '{filepath}' and standard lat/lon coords not detected.")
             
-    return elevation_da
+    return elev_da
 
 def find_swot_files(base_path: str, cycle_id: str, pass_id: str, product_type: str) -> Optional[str]:
-    target_pattern_part = f"SWOT_L2_LR_SSH_{product_type}_{cycle_id}_{pass_id}_"
+    pattern_part = f"SWOT_L2_LR_SSH_{product_type}_{cycle_id}_{pass_id}_"
     for filename in os.listdir(base_path):
-        if filename.startswith(target_pattern_part) and filename.endswith(".nc"):
+        if filename.startswith(pattern_part) and filename.endswith(".nc"):
             return os.path.join(base_path, filename)
-    print(f"Aucun fichier {product_type} trouvé pour cycle {cycle_id}, pass {pass_id} avec le motif {target_pattern_part}")
+    log.warning(f"Aucun fichier {product_type} trouvé pour cycle {cycle_id}, pass {pass_id} avec le motif {pattern_part}")
     return None
 
 def read_swot_datafile(filepath: str, is_expert: bool = False) -> Union[xr.Dataset, Dict[str, xr.Dataset], None]:
     if not os.path.exists(filepath):
-        print(f"Erreur (read_swot_datafile): Fichier non trouvé : {filepath}")
+        log.warning(f"Erreur (read_swot_datafile): Fichier non trouvé : {filepath}")
         return None
     
     try:
@@ -54,45 +68,31 @@ def read_swot_datafile(filepath: str, is_expert: bool = False) -> Union[xr.Datas
             return xr.open_dataset(filepath, engine='netcdf4')
         else: 
             with h5py.File(filepath, 'r') as f:
-                available_top_level_keys = list(f.keys())
+                top_keys = list(f.keys())
 
-            expected_groups = ["left", "right"]
-            groups_to_load = [g for g in expected_groups if g in available_top_level_keys]
+            groups = ["left", "right"]
+            load_groups = [g for g in groups if g in top_keys]
 
-            if not groups_to_load:
-                print(f"Warning (read_swot_datafile): Groupes {expected_groups} non trouvés dans {os.path.basename(filepath)}. Tentative de lecture de la racine.")
+            if not load_groups:
+                log.warning(f"Warning (read_swot_datafile): Groupes {groups} non trouvés dans {os.path.basename(filepath)}. Tentative de lecture de la racine.")
                 try:
                     ds_root = xr.open_dataset(filepath, engine='netcdf4')
                     return {'data_root': ds_root} if ds_root.data_vars or ds_root.coords else {}
-                except Exception as e_root:
-                    print(f"Erreur (read_swot_datafile): Impossible de charger la racine de {os.path.basename(filepath)}: {e_root}")
+                except Exception as e:
+                    log.warning(f"Erreur (read_swot_datafile): Impossible de charger la racine de {os.path.basename(filepath)}: {e}")
                     return None
 
             data_dict = {}
-            for group_name in groups_to_load:
+            for group in load_groups:
                 try:
-                    data_dict[group_name] = xr.open_dataset(filepath, group=group_name, engine='netcdf4')
-                except Exception as e_group:
-                    print(f"Warning (read_swot_datafile): Impossible de charger le groupe '{group_name}' depuis {filepath}: {e_group}")
+                    data_dict[group] = xr.open_dataset(filepath, group=group, engine='netcdf4')
+                except Exception as e:
+                    log.warning(f"Warning (read_swot_datafile): Impossible de charger le groupe '{group}' depuis {filepath}: {e}")
             
             if not data_dict:
-                print(f"Erreur (read_swot_datafile): Aucun groupe attendu n'a pu être chargé depuis {os.path.basename(filepath)}.")
+                log.warning(f"Erreur (read_swot_datafile): Aucun groupe attendu n'a pu être chargé depuis {os.path.basename(filepath)}.")
                 return None
             return data_dict
     except Exception as e:
-        print(f"Erreur (read_swot_datafile): Erreur générale lors de la lecture de {filepath}: {e}")
+        log.warning(f"Erreur (read_swot_datafile): Erreur générale lors de la lecture de {filepath}: {e}")
         return None
-
-
-def extract_swot_filename_info(filename: str) -> Optional[Dict[str, Any]]:
-    basename = os.path.basename(filename)
-    pattern = r"SWOT_L2_LR_SSH_(Unsmoothed|Expert)_(\d{3})_(\d{3})_(\d{8}T\d{6})_(\d{8}T\d{6})_(\w+)_(\d{2})\.nc"
-    match = re.match(pattern, basename)
-    if match:
-        return {
-            "product_type": match.group(1), "cycle": int(match.group(2)), 
-            "pass_id": int(match.group(3)), "start_time": match.group(4), 
-            "end_time": match.group(5), "processing_version": match.group(6), 
-            "processing_counter": int(match.group(7))
-        }
-    return None
