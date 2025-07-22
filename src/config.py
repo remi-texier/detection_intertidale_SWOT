@@ -8,7 +8,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 GLOBAL_CONFIG: Dict[str, Any] = {
     "data_path": os.path.join(PROJECT_ROOT, "data", "L2_LR"),
     "zone_info_filepath": os.path.join(PROJECT_ROOT, "data", 'zone_info.json'),
-    "mnt_filepath": os.path.join(PROJECT_ROOT, "data", "franceRgeAltiLitto3D.nc"),
+    "mnt_filepath": os.path.join(PROJECT_ROOT, "data", "franceRgeAltiLitto3D5m.nc"),
     "mnt_alt": "Band1",
     "mnt_lon": "lon",
     "mnt_lat": "lat",
@@ -19,7 +19,7 @@ GLOBAL_CONFIG: Dict[str, Any] = {
     "tide_gauge_filepath": "data/maregraphie_THA/zone_34_fusionne_tha.txt",
     "rasterization_downsampling_factor": 1,
     
-    "num_processes": 1,
+    "num_processes": 5,
 }
 
 def load_zone_configurations(filepath: str) -> Dict[str, Any]:

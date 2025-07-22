@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Optional
 
 from . import data_loader
-from .processing import swot_processing, dem_processing, inundation_mapping 
+from .processing import Litto3D_processing, swot_processing
 from . import plotting 
 from . import config
 
@@ -186,13 +186,13 @@ def process_and_save_zone_data(zone_id: str, zone_data: dict, config: dict, cycl
     water_level, water_source = water_result
 
     # 4. Chargement MNT
-    elevation_roi = dem_processing.load_and_process_dem(config, ui_queue, report_queue, task_name, pid)
+    elevation_roi = Litto3D_processing.load_and_process_dem(config, ui_queue, report_queue, task_name, pid)
     if elevation_roi is None:
         ui_queue.put((pid, "final", f"[bold red]✗ Erreur MNT: {task_name}[/bold red]"))
         return None
 
     # 5. Calcul inondation
-    inundation_map = inundation_mapping.compute_inundation_map(elevation_roi, water_level, config, ui_queue, pid, task_name)
+    inundation_map = Litto3D_processing.compute_inundation_map(elevation_roi, water_level, config, ui_queue, pid, task_name)
 
     # 6. Sauvegarde NetCDF
     netcdf_path = _create_and_save_netcdf(zone_id, cycle, pass_id, config, swot_data, 
