@@ -6,6 +6,9 @@
         "data_group": [
             "left"
         ],
+        "tile": [
+            "037F"
+        ],
         "extent": {
             "lat": [
                 46.195,
@@ -32,6 +35,10 @@
         "data_group": [
             "left",
             "right"
+        ],
+        "tile": [
+            "038F",
+            "117F"
         ],
         "extent": {
             "lat": [
@@ -111,6 +118,10 @@
             "left",
             "right"
         ],
+        "tile": [
+            "037F",
+            "118F"
+        ],
         "extent": {
             "lat": [
                 46.19,
@@ -138,6 +149,10 @@
             "left",
             "right"
         ],
+        "tile": [
+            "037F",
+            "118F"
+        ],
         "extent": {
             "lat": [
                 46.188,
@@ -162,6 +177,10 @@
         "data_group": [
             "left",
             "right"
+        ],
+        "tile": [
+            "037F",
+            "118F"
         ],
         "extent": {
             "lat": [
@@ -188,6 +207,10 @@
             "left",
             "right"
         ],
+        "tile": [
+            "037F",
+            "118F"
+        ],
         "extent": {
             "lat": [
                 45.828,
@@ -212,6 +235,9 @@
         "data_group": [
             "left",
             "right"
+        ],
+        "tile": [
+            "037F"
         ],
         "extent": {
             "lat": [
