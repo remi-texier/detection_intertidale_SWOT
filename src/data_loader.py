@@ -6,7 +6,7 @@ import os
 import logging
 import re
 import h5py
-from typing import Dict, Any, Optional, Union
+from typing import Dict, Any, Optional, Union, List
 
 log = logging.getLogger("rich_app")
 
@@ -51,11 +51,99 @@ def load_elevation_data(filepath: str, alt_var: str) -> xr.DataArray:
     return elev_da
 
 def find_swot_files(base_path: str, cycle_id: str, pass_id: str, product_type: str) -> Optional[str]:
-    pattern_part = f"SWOT_L2_LR_SSH_{product_type}_{cycle_id}_{pass_id}_"
-    for filename in os.listdir(base_path):
-        if filename.startswith(pattern_part) and filename.endswith(".nc"):
-            return os.path.join(base_path, filename)
-    log.warning(f"Aucun fichier {product_type} trouvé pour cycle {cycle_id}, pass {pass_id} avec le motif {pattern_part}")
+    if product_type == "HR":
+        hr_path = os.path.join(base_path, "L2_HR")
+        if os.path.exists(hr_path):
+            pattern_start = f"SWOT_L2_HR_Raster_100m_UTM30T_N_x_x_x_{cycle_id}_{pass_id}_"
+            hr_files = []
+            for filename in os.listdir(hr_path):
+                if filename.startswith(pattern_start) and filename.endswith(".nc"):
+                    hr_files.append(os.path.join(hr_path, filename))
+            
+            if hr_files:
+                log.info(f"Trouvé {len(hr_files)} fichier(s) HR pour cycle {cycle_id}, pass {pass_id}")
+                return hr_files[0]
+        log.warning(f"Aucun fichier HR trouvé pour cycle {cycle_id}, pass {pass_id} dans {hr_path}")
+        return None
+    else:
+        lr_path = os.path.join(base_path, "L2_LR")
+        if os.path.exists(lr_path):
+            pattern_part = f"SWOT_L2_LR_SSH_{product_type}_{cycle_id}_{pass_id}_"
+            for filename in os.listdir(lr_path):
+                if filename.startswith(pattern_part) and filename.endswith(".nc"):
+                    return os.path.join(lr_path, filename)
+        log.warning(f"Aucun fichier {product_type} trouvé pour cycle {cycle_id}, pass {pass_id} avec le motif {pattern_part}")
+        return None
+
+def find_hr_tiles(base_path: str, cycle_id: str, pass_id: str) -> List[str]:
+    hr_files = []
+    hr_path = os.path.join(base_path, "L2_HR")
+    
+    if os.path.exists(hr_path):
+        pattern_start = f"SWOT_L2_HR_Raster_100m_UTM30T_N_x_x_x_{cycle_id}_{pass_id}_"
+        for filename in os.listdir(hr_path):
+            if filename.startswith(pattern_start) and filename.endswith(".nc"):
+                hr_files.append(os.path.join(hr_path, filename))
+        
+        hr_files.sort()
+        
+        if hr_files:
+            log.info(f"Trouvé {len(hr_files)} tuile(s) HR pour cycle {cycle_id}, pass {pass_id}")
+            for file in hr_files:
+                basename = os.path.basename(file)
+                parts = basename.split('_')
+                if len(parts) >= 12:
+                    tile = parts[12]  # 037F, 038F, etc.
+                    log.info(f"  Tuile: {tile} - {basename}")
+    
+    return hr_files
+
+def get_tiles(base_path: str, cycle_id: str, pass_id: str, zone_data: Optional[Dict] = None) -> Optional[str]:
+    available_tiles = find_hr_tiles(base_path, cycle_id, pass_id)
+    
+    if not available_tiles:
+        return None
+    
+    if len(available_tiles) == 1:
+        return available_tiles[0]
+    
+    if zone_data and 'tile' in zone_data:
+        preferred_tiles = zone_data['tile']
+        if isinstance(preferred_tiles, str):
+            preferred_tiles = [preferred_tiles]
+        
+        for available_file in available_tiles:
+            tile_info = extract_tile_info_from_filename(available_file)
+            if tile_info and tile_info['tile'] in preferred_tiles:
+                log.info(f"Tuile HR sélectionnée selon configuration zone: {tile_info['tile']}")
+                return available_file
+        
+        log.warning(f"Aucune des tiles préférées {preferred_tiles} n'est disponible. Utilisation du fallback.")
+    
+    tile_info = extract_tile_info_from_filename(available_tiles[0])
+    if tile_info:
+        log.info(f"Tuile HR sélectionnée par défaut: {tile_info['tile']}")
+    return available_tiles[0]
+
+def extract_tile_info_from_filename(filename: str) -> Optional[Dict[str, str]]:
+    """
+    Extrait les informations (cycle, pass, tuile) d'un nom de fichier HR.
+    Format: SWOT_L2_HR_Raster_100m_UTM30T_N_x_x_x_{cycle}_{pass}_{tile}_...
+    """
+    basename = os.path.basename(filename)
+    parts = basename.split('_')
+    
+    if len(parts) >= 13 and parts[0] == "SWOT" and parts[1] == "L2" and parts[2] == "HR":
+        try:
+            return {
+                'cycle': parts[10],
+                'pass': parts[11], 
+                'tile': parts[12],
+                'filename': basename
+            }
+        except (IndexError, ValueError):
+            pass
+    
     return None
 
 def read_swot_datafile(filepath: str, is_expert: bool = False) -> Union[xr.Dataset, Dict[str, xr.Dataset], None]:
@@ -66,7 +154,17 @@ def read_swot_datafile(filepath: str, is_expert: bool = False) -> Union[xr.Datas
     try:
         if is_expert:
             return xr.open_dataset(filepath, engine='netcdf4')
-        else: 
+        
+        is_hr_file = "HR_Raster" in os.path.basename(filepath)
+        
+        if is_hr_file:
+            try:
+                ds = xr.open_dataset(filepath, engine='netcdf4')
+                return {"main": ds}  
+            except Exception as e:
+                log.warning(f"Erreur (read_swot_datafile): Impossible de charger le fichier HR {filepath}: {e}")
+                return None
+        else:
             with h5py.File(filepath, 'r') as f:
                 top_keys = list(f.keys())
 

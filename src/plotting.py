@@ -116,7 +116,7 @@ def create_plots_from_netcdf(netcdf_filepath: str, config: dict, ui_queue, repor
             return
 
         fig, axes = plt.subplots(1, len(plot_elements), figsize=(7 * len(plot_elements), 6.5), squeeze=False)
-        plot_map = {"swot_sig0": ("SWOT sig0", 'gray', 'sig0 (dB)'), "swot_ssh": ("SWOT SSH", 'viridis', 'SSH (m)')}
+        plot_map = {"swot_sig0": ("SWOT sig0", 'gray', 'sig0'), "swot_ssh": ("SWOT SSH", 'viridis', 'SSH (m)')}
 
         for i, element in enumerate(plot_elements):
             ax = axes[0, i]
