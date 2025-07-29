@@ -1,4 +1,5 @@
 import logging
+import traceback
 import xarray as xr
 import numpy as np
 import scipy.ndimage
@@ -75,8 +76,10 @@ def load_and_process_dem(config: Dict[str, Any], ui_queue, report_queue, task_na
             elevation_crop = mnt[alt_var].sel({lon: lon_slice, lat: lat_slice}).load()
         elevation_roi, _ = crop_to_roi(elevation_crop, roi, lon, lat)
     except Exception as e:
-        msg = f"Erreur critique lors du chargement/rognage du MNT : {e}"
+        tb_str = traceback.format_exc()
+        msg = f"Erreur critique lors du chargement/rognage du MNT : {e}\n\nTraceback:\n{tb_str}"
         report_queue.put({'task_name': task_name, 'level': 'ERROR', 'message': msg})
+        logging.error(f"Échec du chargement du MNT pour {task_name}", exc_info=True)
         return None
     if elevation_roi is None or elevation_roi.size == 0:
         msg = "Le MNT est vide après application de la ROI. La zone est probablement hors de la couverture du MNT."

@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import os
 import logging
+import traceback
 import re
 import h5py
 from typing import Dict, Any, Optional, Union, List
@@ -192,5 +193,6 @@ def read_swot_datafile(filepath: str, is_expert: bool = False) -> Union[xr.Datas
                 return None
             return data_dict
     except Exception as e:
-        log.warning(f"Erreur (read_swot_datafile): Erreur générale lors de la lecture de {filepath}: {e}")
+        tb_str = traceback.format_exc()
+        log.error(f"Erreur générale lors de la lecture de {filepath}: {e}\n\nTraceback:\n{tb_str}", exc_info=True)
         return None

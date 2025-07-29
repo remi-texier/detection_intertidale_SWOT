@@ -4,6 +4,7 @@ import os
 import multiprocessing
 import threading
 import logging
+import traceback
 import time
 from collections import deque, defaultdict
 from typing import Dict, List, Any, Tuple
@@ -186,7 +187,9 @@ def process_single_task(task_args_tuple):
     sys.stdout = stdout_relay
     sys.stderr = stderr_relay
 
-    logging.basicConfig(level=logging.WARNING, stream=stderr_relay, force=True)
+    logging.basicConfig(level=logging.INFO, stream=stderr_relay, force=True,
+                        format='%(levelname)s: %(message)s')
+    log_worker = logging.getLogger("worker_log")
 
     try:
         netcdf_output_path = analysis.process_and_save_zone_data(
@@ -197,11 +200,12 @@ def process_single_task(task_args_tuple):
                 netcdf_filepath=netcdf_output_path, config=config,
                 ui_queue=ui_queue, report_queue=report_queue, task_name=task_name)
     except Exception as e:
-        print(f"[bold red]!!! ERREUR CRITIQUE NON GÉRÉE DANS LA TÂCHE {task_name} (PID: {pid}) !!![/bold red]")
-        print(f"[bold red]Détail: {e}[/bold red]")
-        
-        report_queue.put({'task_name': task_name, 'level': 'ERROR', 'message': f"Erreur critique non gérée : {e}"})
-        ui_queue.put((pid, "final", f"[bold red]✗ Échec inattendu: {task_name}[/bold red]"))
+        tb_str = traceback.format_exc()
+        log_worker.error(f"ERREUR CRITIQUE NON GÉRÉE DANS LA TÂCHE {task_name} (PID: {pid})")
+        log_worker.error(tb_str)
+        detailed_message = f"Erreur critique non gérée : {e}\n\nTraceback:\n{tb_str}"
+        report_queue.put({'task_name': task_name, 'level': 'ERROR', 'message': detailed_message})
+        ui_queue.put((pid, "final", f"[bold red]✗ Échec critique: {task_name}[/bold red]"))
     finally:
         stdout_relay.flush()
         stderr_relay.flush()

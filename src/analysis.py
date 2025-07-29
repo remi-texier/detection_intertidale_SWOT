@@ -1,10 +1,12 @@
 # src/analysis.py
 import os
+import traceback
 import numpy as np
 import pandas as pd
 import xarray as xr
 from datetime import datetime
 from typing import Optional
+import logging
 
 from . import data_loader
 from .processing import Litto3D_processing, swot_processing
@@ -149,8 +151,10 @@ def _create_and_save_netcdf(zone_id, cycle, pass_id, config, swot_data,
             ui_queue.put((pid, "log", f"NetCDF OK: {os.path.basename(netcdf_path)}"))
             return netcdf_path
         except Exception as e:
-            msg = f"Erreur lors de la sauvegarde du fichier NetCDF '{netcdf_name}': {e}"
+            tb_str = traceback.format_exc()
+            msg = f"Erreur lors de la sauvegarde du NetCDF '{netcdf_name}': {e}\n\n{tb_str}"
             report_queue.put({'task_name': task_name, 'level': 'ERROR', 'message': msg})
+            logging.error(msg)
             return None
     else:
         msg = "Aucune donnée n'a été générée pour la rasterisation. Le fichier NetCDF de sortie serait vide."
