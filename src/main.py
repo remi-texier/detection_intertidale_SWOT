@@ -4,6 +4,7 @@ import os
 import multiprocessing
 import threading
 import logging
+import traceback
 import time
 from collections import deque, defaultdict
 from typing import Dict, List, Any, Tuple
@@ -186,7 +187,9 @@ def process_single_task(task_args_tuple):
     sys.stdout = stdout_relay
     sys.stderr = stderr_relay
 
-    logging.basicConfig(level=logging.WARNING, stream=stderr_relay, force=True)
+    logging.basicConfig(level=logging.INFO, stream=stderr_relay, force=True,
+                        format='%(levelname)s: %(message)s')
+    log_worker = logging.getLogger("worker_log")
 
     try:
         netcdf_output_path = analysis.process_and_save_zone_data(
@@ -197,11 +200,12 @@ def process_single_task(task_args_tuple):
                 netcdf_filepath=netcdf_output_path, config=config,
                 ui_queue=ui_queue, report_queue=report_queue, task_name=task_name)
     except Exception as e:
-        print(f"[bold red]!!! ERREUR CRITIQUE NON GÉRÉE DANS LA TÂCHE {task_name} (PID: {pid}) !!![/bold red]")
-        print(f"[bold red]Détail: {e}[/bold red]")
-        
-        report_queue.put({'task_name': task_name, 'level': 'ERROR', 'message': f"Erreur critique non gérée : {e}"})
-        ui_queue.put((pid, "final", f"[bold red]✗ Échec inattendu: {task_name}[/bold red]"))
+        tb_str = traceback.format_exc()
+        log_worker.error(f"ERREUR CRITIQUE NON GÉRÉE DANS LA TÂCHE {task_name} (PID: {pid})")
+        log_worker.error(tb_str)
+        detailed_message = f"Erreur critique non gérée : {e}\n\nTraceback:\n{tb_str}"
+        report_queue.put({'task_name': task_name, 'level': 'ERROR', 'message': detailed_message})
+        ui_queue.put((pid, "final", f"[bold red]✗ Échec critique: {task_name}[/bold red]"))
     finally:
         stdout_relay.flush()
         stderr_relay.flush()
@@ -212,31 +216,94 @@ def process_single_task(task_args_tuple):
 
 def generate_tasks_from_filesystem(data_path: str, all_zones_info: Dict[str, Any], global_cfg: Dict[str, Any]) -> List[Tuple]:
     log.info(f"Génération des tâches à partir des fichiers dans : {data_path}")
+    
+    # Récupérer le type de données configuré
+    data_type = global_cfg.get("data_type", "LR")  # Par défaut LR
+    log.info(f"Type de données configuré : {data_type}")
+    
     if not os.path.isdir(data_path):
-        log.error(f"Le répertoire de données de base n'existe pas : {data_path}"); return []
+        log.error(f"Le répertoire de données de base n'existe pas : {data_path}")
+        return []
+    
     tasks_to_process, processed_combinations = [], set()
-    for filename in os.listdir(data_path):
-        if not filename.endswith(".nc"): continue
+    
+    if data_type == "HR":
+        search_path = os.path.join(data_path, "L2_HR")
+        log.info(f"Recherche de fichiers HR dans : {search_path}")
+    elif data_type == "LR":
+        search_path = os.path.join(data_path, "L2_LR")
+        log.info(f"Recherche de fichiers LR dans : {search_path}")
+        if not os.path.exists(search_path):
+            search_path = data_path
+            log.info(f"Dossier L2_LR non trouvé, utilisation du dossier racine : {search_path}")
+    else:
+        log.error(f"Type de données non supporté : {data_type}. Utilisez 'HR' ou 'LR'.")
+        return []
+    
+    if not os.path.isdir(search_path):
+        log.error(f"Le répertoire de données {data_type} n'existe pas : {search_path}")
+        return []
+            
+    for filename in os.listdir(search_path):
+        if not filename.endswith(".nc"): 
+            continue
+            
+        cycle_num, pass_id_num = None, None
+        
         try:
-            parts = filename.split('_')
-            if len(parts) < 7: continue
-            cycle_num, pass_id_num = int(parts[5]), int(parts[6])
+            if data_type == "HR":
+                # Format HR: SWOT_L2_HR_Raster_100m_UTM30T_N_x_x_x_{cycle}_{pass}_{tile}_...
+                parts = filename.split('_')
+                if len(parts) >= 13 and parts[0] == "SWOT" and parts[1] == "L2" and parts[2] == "HR":
+                    cycle_num = int(parts[10])
+                    pass_id_num = int(parts[11])
+                    tile = parts[12]
+                    log.debug(f"Fichier HR trouvé: cycle={cycle_num}, pass={pass_id_num}, tuile={tile}")
+            elif data_type == "LR":
+                # Format LR: SWOT_L2_LR_SSH_*_{cycle}_{pass}_... ou ancien format
+                parts = filename.split('_')
+                if len(parts) >= 7:
+                    if parts[1] == "L2" and parts[2] == "LR":
+                        cycle_num = int(parts[5])
+                        pass_id_num = int(parts[6])
+                    else:
+                        cycle_num = int(parts[5])
+                        pass_id_num = int(parts[6])
+                    log.debug(f"Fichier LR trouvé: cycle={cycle_num}, pass={pass_id_num}")
+            
+            if cycle_num is None or pass_id_num is None:
+                continue
+                
+            # Cherche les zones correspondant à ce pass
             for zone_id, zone_data in all_zones_info.items():
                 if pass_id_num in zone_data.get("pass_id", []):
                     task_key = (zone_id, cycle_num, pass_id_num)
-                    if task_key in processed_combinations: continue
+                    if task_key in processed_combinations: 
+                        continue
+                    
                     current_config_for_zone = global_cfg.copy()
                     current_config_for_zone["target_zone_id"] = zone_id
-                    if "extent" not in zone_data or "lon" not in zone_data["extent"] or "lat" not in zone_data["extent"]: continue
-                    current_config_for_zone["analysis_roi_bbox_dict"]= zone_data["extent"]
+                    
+                    if "extent" not in zone_data or "lon" not in zone_data["extent"] or "lat" not in zone_data["extent"]: 
+                        continue
+                    current_config_for_zone["analysis_roi_bbox_dict"] = zone_data["extent"]
+                    
                     specific_tide_path = zone_data.get("tide_gauge_filepath")
-                    if not specific_tide_path: continue
+                    if not specific_tide_path: 
+                        continue
                     current_config_for_zone["tide_gauge_filepath"] = os.path.join(app_config.PROJECT_ROOT, specific_tide_path)
+                    
                     task_args = (zone_id, zone_data, current_config_for_zone, cycle_num, pass_id_num)
                     tasks_to_process.append(task_args)
                     processed_combinations.add(task_key)
-        except (ValueError, IndexError):
-            log.warning(f"Fichier au format non reconnu ignoré : {filename}"); continue
+                    
+                    log.info(f"Tâche ajoutée: {zone_id} - Cycle {cycle_num}, Pass {pass_id_num} (type: {data_type})")
+                    
+        except (ValueError, IndexError) as e:
+            log.debug(f"Fichier au format non reconnu ignoré ({data_type}): {filename} - Erreur: {e}")
+            continue
+    
+    log.info(f"Total des tâches générées: {len(tasks_to_process)}")
     return tasks_to_process
 
 def main():
