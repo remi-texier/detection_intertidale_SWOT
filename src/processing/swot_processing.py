@@ -1,5 +1,6 @@
 # src/processing/swot_processing.py
 import logging
+import os
 import xarray as xr
 import numpy as np
 from scipy.interpolate import griddata
@@ -10,6 +11,10 @@ import pandas as pd
 import rioxarray as rxr
 from rasterio.crs import CRS
 from rasterio.warp import transform_bounds
+import pyproj
+from scipy.spatial import cKDTree
+from rasterio.enums import Resampling
+
 
 from .. import data_loader
 
@@ -165,95 +170,100 @@ def load_and_process_swot_data(config: dict, cycle: str, pass_id: str, zone_data
     """Charge et traite les données SWOT."""
     ui_queue.put((pid, "status", f"{task_name} | Chargement SWOT..."))
     
-    hr_file = data_loader.get_tiles(config["data_path"], cycle, pass_id, zone_data)
-    
-    if hr_file:
-        ui_queue.put((pid, "log", f"Données HR 100m détectées: {hr_file}"))
-        main_data = data_loader.read_swot_datafile(hr_file, is_expert=False)
-        is_hr_data = True
-        expert_data = None 
+    is_hr_data = config.get("data_type") == "HR"
+    main_data, expert_data, source_file = None, None, None
+
+    if is_hr_data:
+        ui_queue.put((pid, "log", "Traitement de données HR."))
+        hr_file = data_loader.get_tiles(config["data_path"], cycle, pass_id, zone_data)
+        if hr_file:
+            ui_queue.put((pid, "log", f"Fichier HR trouvé : {os.path.basename(hr_file)}"))
+            main_data = data_loader.read_swot_datafile(hr_file, is_expert=False)
+            source_file = hr_file
     else:
-        expert_file = data_loader.find_swot_files(config["data_path"], cycle, pass_id, "Expert") 
+        ui_queue.put((pid, "log", "Traitement de données LR."))
+        expert_file = data_loader.find_swot_files(config["data_path"], cycle, pass_id, "Expert")
         unsmoothed_file = data_loader.find_swot_files(config["data_path"], cycle, pass_id, "Unsmoothed")
         
-        if not expert_file:
-            msg = f"Fichier SWOT Expert manquant pour la passe {pass_id} / cycle {cycle}. Le traitement est abandonné car la correction SSH est requise."
-            report_queue.put({'task_name': task_name, 'level': 'WARNING', 'message': msg})
+        if not unsmoothed_file:
+            msg = f"Fichier SWOT LR Unsmoothed manquant pour {task_name}. Traitement abandonné."
+            report_queue.put({'task_name': task_name, 'level': 'ERROR', 'message': msg})
             return None, None
+        
+        main_data = data_loader.read_swot_datafile(unsmoothed_file, is_expert=False)
+        expert_data = data_loader.read_swot_datafile(expert_file, is_expert=True) if expert_file else None
+        source_file = unsmoothed_file
 
-        expert_data = data_loader.read_swot_datafile(expert_file, is_expert=True) if expert_file else None 
-        main_data = data_loader.read_swot_datafile(unsmoothed_file, is_expert=False) 
-        is_hr_data = False
-
-    if not main_data or not any(isinstance(ds, xr.Dataset) for ds in (main_data.values() if isinstance(main_data, dict) else [main_data])): 
-        msg = "Aucune donnée SWOT chargée depuis le fichier. Le fichier pourrait être corrompu ou vide."
+    if not main_data or not any(isinstance(ds, xr.Dataset) for ds in (main_data.values() if isinstance(main_data, dict) else [main_data])):
+        msg = f"Aucune donnée SWOT n'a pu être chargée pour {task_name}."
         report_queue.put({'task_name': task_name, 'level': 'ERROR', 'message': msg})
         return None, None
-    
+
     ui_queue.put((pid, "status", f"{task_name} | Traitement SWOT..."))
-    
-    if is_hr_data:
-        if isinstance(main_data, dict):
-            filtered = {k: v for k, v in main_data.items() if isinstance(v, xr.Dataset)}
-        else:
-            filtered = {"main": main_data}
-            
-        ui_queue.put((pid, "log", "Transformation coordonnées HR UTM→Géographique..."))
-        for group_name, ds in filtered.items():
-            if isinstance(ds, xr.Dataset):
-                filtered[group_name] = ds
+
+    if isinstance(main_data, dict):
+        filtered_groups = {k: v for k, v in main_data.items() if isinstance(v, xr.Dataset)}
     else:
-        allowed_groups = zone_data.get("data_group", []) 
-        filtered = {gn: ds for gn, ds in main_data.items() if not allowed_groups or gn in allowed_groups}
-        
-    if not filtered: 
-        msg = f"Aucun groupe de données ne correspond à la configuration."
+        filtered_groups = {"main": main_data}
+
+    if not is_hr_data and (allowed := zone_data.get("data_group")):
+        filtered_groups = {gn: ds for gn, ds in filtered_groups.items() if gn in allowed}
+
+    if not filtered_groups:
+        msg = f"Aucun groupe de données ne correspond à la config pour {task_name}."
         report_queue.put({'task_name': task_name, 'level': 'WARNING', 'message': msg})
         return None, None
 
     key_variables = HR100M_VARIABLES if is_hr_data else LR250M_VARIABLES
-    cleaned = clean_swot_dataset_variables(filtered, key_variables) 
+    cleaned_groups = clean_swot_dataset_variables(filtered_groups, key_variables)
+    roi_groups = apply_roi_to_swot_data_groups(cleaned_groups, config["analysis_roi_bbox_dict"])
     
-    roi_bbox = config["analysis_roi_bbox_dict"] 
-    roi_groups = apply_roi_to_swot_data_groups(cleaned, roi_bbox) 
-    
-    expert_roi = None 
-    if expert_data is not None and not is_hr_data: 
-        expert_cleaned = clean_swot_dataset_variables(expert_data, key_variables) 
-        expert_roi = apply_roi_to_swot_dataset(expert_cleaned, roi_bbox) 
+    final_groups = {}
+    for group_name, ds in roi_groups.items():
+        if not isinstance(ds, xr.Dataset) or not (ds.sizes.get('y', 0) > 0 or ds.sizes.get('num_lines', 0) > 0):
+            continue
 
-    if is_hr_data:
-        valid_groups = {gn: ds for gn, ds in roi_groups.items() if isinstance(ds, xr.Dataset) and (ds.sizes.get('y', 0) > 0 or ds.sizes.get('num_lines', 0) > 0)}
-    else:
-        valid_groups = {gn: ds for gn, ds in roi_groups.items() if isinstance(ds, xr.Dataset) and ds.sizes.get('num_lines', 0) > 0}
-        
-    if not valid_groups: 
-        msg = "Aucune donnée SWOT ne se trouve dans la zone d'intérêt (ROI) après filtrage."
+        ds_filtered = apply_quality_flags(ds, config)
+
+        if is_hr_data:
+            if "wse" in ds_filtered and "geoid" in ds_filtered:
+                ds_filtered["ssh"] = ds_filtered["wse"] + ds_filtered["geoid"]
+                final_groups[group_name] = ds_filtered
+        else: # Cas LR
+            expert_roi = apply_roi_to_swot_dataset(expert_data, config["analysis_roi_bbox_dict"]) if expert_data else None
+            corrected_ds = apply_ssh_correction(ds_filtered, expert_roi)
+            final_groups[group_name] = corrected_ds
+            
+    valid_groups = {k: v for k, v in final_groups.items() if v.notnull().any()}
+    if not valid_groups:
+        msg = f"Aucune donnée SWOT valide après filtrage qualité et ROI pour {task_name}."
         report_queue.put({'task_name': task_name, 'level': 'WARNING', 'message': msg})
         return None, None
-    
-    if is_hr_data:
-        final_groups = valid_groups
-        for group_name, ds in final_groups.items():
-            if "wse" in ds and "geoid" in ds:
-                ds["ssh"] = ds["wse"] + ds["geoid"]
-                log.info(f"SSH calculé pour le groupe HR {group_name}: ssh = wse + geoid")
-    else:
-        expert_valid = (expert_roi is not None and isinstance(expert_roi, xr.Dataset) and expert_roi.sizes.get('num_lines', 0) > 0)
-        final_groups = apply_ssh_correction(valid_groups, expert_roi if expert_valid else None) 
 
-    if is_hr_data:
-        display_group = next(iter(final_groups.keys()))
-    else:
-        allowed_groups = zone_data.get("data_group", [])
-        display_group = next((g for g in (allowed_groups or final_groups.keys()) if g in final_groups and isinstance(final_groups[g], xr.Dataset)), None)
-        
-    if not display_group: 
-        msg = "Aucun groupe SWOT valide ne contient de données après tous les filtrages."
+    display_group_name = next(iter(valid_groups.keys()), None)
+    if not is_hr_data and (allowed := zone_data.get("data_group")):
+        display_group_name = next((g for g in allowed if g in valid_groups), display_group_name)
+
+    if not display_group_name:
+        msg = f"Aucun groupe SWOT valide après traitement pour {task_name}."
         report_queue.put({'task_name': task_name, 'level': 'WARNING', 'message': msg})
         return None, None
+        
+    ui_queue.put((pid, "log", f"Traitement SWOT pour le groupe '{display_group_name}' terminé."))
     
-    return final_groups[display_group], hr_file if is_hr_data else unsmoothed_file
+    return valid_groups[display_group_name], source_file
+
+def apply_quality_flags(swot_data: xr.Dataset, config: dict) -> xr.Dataset:
+    quality_config = config.get("swot_quality_filter", {})
+    accepted_values = quality_config.get("accepted_values", [0])
+    variable_map = quality_config.get("variable_map", {})
+    filtered_ds = swot_data.copy(deep=True)
+    
+    for data_var, qual_var in variable_map.items():
+        if data_var in filtered_ds and qual_var in filtered_ds:
+            quality_mask = filtered_ds[qual_var].isin(accepted_values)
+            filtered_ds[data_var] = filtered_ds[data_var].where(quality_mask)
+    return filtered_ds
 
 def process_swot_orientation_and_time(swot_data, ui_queue, report_queue, task_name, pid):
     is_hr = is_hr_dataset(swot_data)
@@ -325,59 +335,120 @@ def process_swot_orientation_and_time(swot_data, ui_queue, report_queue, task_na
 
 def rasterize_swot_data(swot_data: xr.Dataset, target_grid: xr.DataArray, config: dict) -> Dict[str, xr.DataArray]:
     result = {}
-    lon_mesh, lat_mesh = np.meshgrid(target_grid[config["mnt_lon"]].values, target_grid[config["mnt_lat"]].values, indexing='xy')
     
-    src_lons = _normalize_longitude_array(swot_data.longitude).values.flatten()
-    src_lats = swot_data.latitude.values.flatten()
+    target_lon = target_grid[config["mnt_lon"]].values
+    target_lat = target_grid[config["mnt_lat"]].values
+    lon_mesh, lat_mesh = np.meshgrid(target_lon, target_lat, indexing='xy')
+    
+    src_lons_raw = _normalize_longitude_array(swot_data.longitude).values.flatten()
+    src_lats_raw = swot_data.latitude.values.flatten()
 
     is_hr = is_hr_dataset(swot_data)
     
     if is_hr:
         vars_to_rasterize = {
-            'swot_ssh': {'src_var': 'ssh', 'units': 'm'},  
-            'swot_sig0': {'src_var': 'sig0', 'units': 'dB'}  
+            'swot_ssh': {'src_var': 'ssh', 'units': 'm'},
+            'swot_sig0': {'src_var': 'sig0', 'units': 'linear'}
         }
-        
         if 'ssh' not in swot_data and 'wse' in swot_data and 'geoid' in swot_data:
-            ssh = swot_data['wse'] + swot_data['geoid']
-            src_values_ssh = ssh.values.flatten()
-            valid_mask_ssh = ~np.isnan(src_lons) & ~np.isnan(src_lats) & ~np.isnan(src_values_ssh)
-            
-            if np.any(valid_mask_ssh):
-                raster_data = np.full(lon_mesh.shape, np.nan)
-                interpolated = griddata(np.vstack((src_lons[valid_mask_ssh], src_lats[valid_mask_ssh])).T, 
-                                       src_values_ssh[valid_mask_ssh], (lon_mesh, lat_mesh), method='linear', fill_value=np.nan)
-                raster_data = interpolated  
-                
-                result['swot_ssh'] = xr.DataArray(data=raster_data, coords=target_grid.coords, dims=target_grid.dims, 
-                                                name='swot_ssh', attrs={'units': 'm'})
-            
-            vars_to_rasterize.pop('swot_ssh', None)
+            swot_data['ssh'] = swot_data['wse'] + swot_data['geoid']
     else:
         vars_to_rasterize = {
             'swot_ssh': {'src_var': 'ssh_karin_2_corrected', 'units': 'm'},
             'swot_sig0': {'src_var': 'sig0_karin_2', 'units': 'dB'}
         }
 
+    valid_coords_mask = ~np.isnan(src_lons_raw) & ~np.isnan(src_lats_raw)
+    src_lons_valid = src_lons_raw[valid_coords_mask]
+    src_lats_valid = src_lats_raw[valid_coords_mask]
+
+    if src_lons_valid.size == 0:
+        log.warning("Aucune coordonnée SWOT valide trouvée pour la rastérisation.")
+        return {}
+    
+    transformer = pyproj.Transformer.from_crs("EPSG:4979", "EPSG:32630", always_xy=True)
+    src_x_proj, src_y_proj = transformer.transform(src_lons_valid, src_lats_valid)
+    src_points_proj = np.vstack((src_x_proj, src_y_proj)).T
+
+    log.info(f"Construction de l'arbre de recherche (cKDTree) avec {len(src_points_proj)} points SWOT.")
+    kdtree = cKDTree(src_points_proj)
+
+    target_grid_proj = target_grid.rio.reproject("EPSG:32630")
+    target_x_mesh, target_y_mesh = np.meshgrid(target_grid_proj.x.values, target_grid_proj.y.values, indexing='xy')
+    target_points_proj = np.vstack((target_x_mesh.ravel(), target_y_mesh.ravel())).T
+    
+    log.info("Calcul des distances sur la grille projetée...")
+    distances, _ = kdtree.query(target_points_proj, k=1)
+    
+    distances_proj_da = xr.DataArray(
+        data=distances.reshape(target_x_mesh.shape),
+        coords=target_grid_proj.coords,
+        dims=target_grid_proj.dims
+    )
+    distances_proj_da.rio.write_crs(target_grid_proj.rio.crs, inplace=True)
+    
+    log.info("Reprojection du masque de distance pour correspondre à la grille MNT originale...")
+    distances_matched_da = distances_proj_da.rio.reproject_match(target_grid, resampling=Resampling.bilinear)
+
+    max_dist = config.get("interpolation_max_distance", 250)
+    distance_mask = distances_matched_da.values <= max_dist
+    log.info(f"Masque final créé. {np.sum(distance_mask) / distance_mask.size * 100:.1f}% de la grille sera conservé (distance < {max_dist}m).")
+
     for out_name, params in vars_to_rasterize.items():
         src_var = params['src_var']
         if src_var not in swot_data:
+            log.warning(f"Variable source '{src_var}' non trouvée dans le dataset, ignorée.")
             continue
             
         src_values = swot_data[src_var].values.flatten()
-        valid_mask = ~np.isnan(src_lons) & ~np.isnan(src_lats) & ~np.isnan(src_values)
         
-        if np.any(valid_mask):
-            if is_hr:
-                raster_data = np.full(lon_mesh.shape, np.nan)
-                interpolated = griddata(np.vstack((src_lons[valid_mask], src_lats[valid_mask])).T, 
-                                       src_values[valid_mask], (lon_mesh, lat_mesh), method='linear', fill_value=np.nan)
-                raster_data = interpolated  
-            else:
-                raster_data = griddata(np.vstack((src_lons[valid_mask], src_lats[valid_mask])).T, 
-                                     src_values[valid_mask], (lon_mesh, lat_mesh), method='linear')
-            
-            result[out_name] = xr.DataArray(data=raster_data, coords=target_grid.coords, dims=target_grid.dims, 
-                                          name=out_name, attrs={'units': params['units']})
+        valid_mask_interp = valid_coords_mask & ~np.isnan(src_values)
+        
+        if not np.any(valid_mask_interp):
+            log.warning(f"Aucune donnée valide pour l'interpolation de '{src_var}'.")
+            continue
+
+        interpolated_full = griddata(
+            points=np.vstack((src_lons_raw[valid_mask_interp], src_lats_raw[valid_mask_interp])).T,
+            values=src_values[valid_mask_interp],
+            xi=(lon_mesh, lat_mesh),
+            method='linear'
+        )
+        
+        interpolated_masked = np.where(distance_mask, interpolated_full, np.nan)
+        
+        result[out_name] = xr.DataArray(
+            data=interpolated_masked, 
+            coords=target_grid.coords, 
+            dims=target_grid.dims,
+            name=out_name, 
+            attrs={'units': params['units']}
+        )
             
     return result
+
+def apply_quality_flags(swot_data: xr.Dataset, config: dict) -> xr.Dataset:
+    quality_config = config.get("swot_quality_filter", {})
+    if not quality_config.get("apply", False):
+        log.info("Filtrage par flag de qualité désactivé dans la configuration.")
+        return swot_data
+
+    accepted_values = quality_config.get("accepted_values", [0, 1])
+    variable_map = quality_config.get("variable_map", {})
+    
+    log.info(f"Construction du masque de qualité. Flags acceptés : {accepted_values}")
+    
+    ref_var_name = next((v for v in variable_map.values() if v in swot_data), None)
+    if not ref_var_name:
+        log.warning("Aucune variable de qualité trouvée pour créer le masque. Pas de filtrage.")
+        return swot_data
+        
+    combined_mask = xr.ones_like(swot_data[ref_var_name], dtype=bool)
+
+    for data_var, qual_var in variable_map.items():
+        if data_var in swot_data and qual_var in swot_data:
+            log.info(f" - Intégration du flag '{qual_var}' au masque global.")
+            combined_mask &= swot_data[qual_var].isin(accepted_values)
+    
+    log.info("Application du masque de qualité global au dataset SWOT.")
+    return swot_data.where(combined_mask)

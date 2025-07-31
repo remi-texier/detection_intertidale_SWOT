@@ -17,8 +17,19 @@ GLOBAL_CONFIG: Dict[str, Any] = {
     "depression_depth_for_isolated_source": 0.1,
     "inundation_margin": 0.1,
     "results_base_path": os.path.join(PROJECT_ROOT, "results"),
+    "swot_quality_filter": {
+        "apply": True,
+        "accepted_values": [0, 1],
+        "variable_map": {
+            "wse": "wse_qual",
+            "sig0": "sig0_qual",
+            "ssh_karin_2": "ssh_karin_qual",
+            "ssh_karin_2_corrected": "ssh_karin_qual"
+        }
+    },
     "rasterization_downsampling_factor": 1,
-    "num_processes": 8,
+    "interpolation_max_distance": 100, 
+    "num_processes": 10,
 }
 
 def load_zone_configurations(filepath: str) -> Dict[str, Any]:

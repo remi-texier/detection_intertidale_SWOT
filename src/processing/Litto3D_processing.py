@@ -85,6 +85,11 @@ def load_and_process_dem(config: Dict[str, Any], ui_queue, report_queue, task_na
         msg = "Le MNT est vide après application de la ROI. La zone est probablement hors de la couverture du MNT."
         report_queue.put({'task_name': task_name, 'level': 'ERROR', 'message': msg})
         return None
+        
+    if elevation_roi.rio.crs is None:
+        log.info("CRS du MNT non détecté, assignation manuelle de l'EPSG:4979 (WGS 84).")
+        elevation_roi = elevation_roi.rio.write_crs("EPSG:4979", inplace=True)
+    
     return elevation_roi
 
 
@@ -123,3 +128,4 @@ def compute_inundation_map(elevation_roi: xr.DataArray, tide_height: float, conf
     pwm = create_perm_water(elevation_roi, thresh)
     margin = config.get("inundation_margin", 0.15)
     return compute_connected_inundation(elevation_roi, tide_height, pwm, config.get("depression", 0.1), margin=margin)
+
