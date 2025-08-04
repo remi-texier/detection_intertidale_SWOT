@@ -55,10 +55,12 @@ def find_swot_files(base_path: str, cycle_id: str, pass_id: str, product_type: s
     if product_type == "HR":
         hr_path = os.path.join(base_path, "L2_HR")
         if os.path.exists(hr_path):
-            pattern_start = f"SWOT_L2_HR_Raster_100m_UTM30T_N_x_x_x_{cycle_id}_{pass_id}_"
+            pattern_start_t = f"SWOT_L2_HR_Raster_100m_UTM30T_N_x_x_x_{cycle_id}_{pass_id}_"
+            pattern_start_u = f"SWOT_L2_HR_Raster_100m_UTM30U_N_x_x_x_{cycle_id}_{pass_id}_"
+
             hr_files = []
             for filename in os.listdir(hr_path):
-                if filename.startswith(pattern_start) and filename.endswith(".nc"):
+                if (filename.startswith(pattern_start_t) or filename.startswith(pattern_start_u)) and filename.endswith(".nc"):
                     hr_files.append(os.path.join(hr_path, filename))
             
             if hr_files:
@@ -81,9 +83,10 @@ def find_hr_tiles(base_path: str, cycle_id: str, pass_id: str) -> List[str]:
     hr_path = os.path.join(base_path, "L2_HR")
     
     if os.path.exists(hr_path):
-        pattern_start = f"SWOT_L2_HR_Raster_100m_UTM30T_N_x_x_x_{cycle_id}_{pass_id}_"
+        pattern_start_t = f"SWOT_L2_HR_Raster_100m_UTM30T_N_x_x_x_{cycle_id}_{pass_id}_"
+        pattern_start_u = f"SWOT_L2_HR_Raster_100m_UTM30U_N_x_x_x_{cycle_id}_{pass_id}_"
         for filename in os.listdir(hr_path):
-            if filename.startswith(pattern_start) and filename.endswith(".nc"):
+            if (filename.startswith(pattern_start_t) or filename.startswith(pattern_start_u)) and filename.endswith(".nc"):
                 hr_files.append(os.path.join(hr_path, filename))
         
         hr_files.sort()

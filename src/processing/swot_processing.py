@@ -14,6 +14,7 @@ from rasterio.warp import transform_bounds
 import pyproj
 from scipy.spatial import cKDTree
 from rasterio.enums import Resampling
+import traceback
 
 
 from .. import data_loader
@@ -173,26 +174,33 @@ def load_and_process_swot_data(config: dict, cycle: str, pass_id: str, zone_data
     is_hr_data = config.get("data_type") == "HR"
     main_data, expert_data, source_file = None, None, None
 
-    if is_hr_data:
-        ui_queue.put((pid, "log", "Traitement de données HR."))
-        hr_file = data_loader.get_tiles(config["data_path"], cycle, pass_id, zone_data)
-        if hr_file:
-            ui_queue.put((pid, "log", f"Fichier HR trouvé : {os.path.basename(hr_file)}"))
-            main_data = data_loader.read_swot_datafile(hr_file, is_expert=False)
-            source_file = hr_file
-    else:
-        ui_queue.put((pid, "log", "Traitement de données LR."))
-        expert_file = data_loader.find_swot_files(config["data_path"], cycle, pass_id, "Expert")
-        unsmoothed_file = data_loader.find_swot_files(config["data_path"], cycle, pass_id, "Unsmoothed")
-        
-        if not unsmoothed_file:
-            msg = f"Fichier SWOT LR Unsmoothed manquant pour {task_name}. Traitement abandonné."
-            report_queue.put({'task_name': task_name, 'level': 'ERROR', 'message': msg})
-            return None, None
-        
-        main_data = data_loader.read_swot_datafile(unsmoothed_file, is_expert=False)
-        expert_data = data_loader.read_swot_datafile(expert_file, is_expert=True) if expert_file else None
-        source_file = unsmoothed_file
+    try:
+        if is_hr_data:
+            ui_queue.put((pid, "log", "Traitement de données HR."))
+            hr_file = data_loader.get_tiles(config["data_path"], cycle, pass_id, zone_data)
+            if hr_file:
+                ui_queue.put((pid, "log", f"Fichier HR trouvé : {os.path.basename(hr_file)}"))
+                main_data = data_loader.read_swot_datafile(hr_file, is_expert=False)
+                source_file = hr_file
+        else:
+            ui_queue.put((pid, "log", "Traitement de données LR."))
+            expert_file = data_loader.find_swot_files(config["data_path"], cycle, pass_id, "Expert")
+            unsmoothed_file = data_loader.find_swot_files(config["data_path"], cycle, pass_id, "Unsmoothed")
+            
+            if not unsmoothed_file:
+                msg = f"Fichier SWOT LR Unsmoothed manquant pour {task_name}. Traitement abandonné."
+                report_queue.put({'task_name': task_name, 'level': 'ERROR', 'message': msg})
+                return None, None
+            
+            main_data = data_loader.read_swot_datafile(unsmoothed_file, is_expert=False)
+            expert_data = data_loader.read_swot_datafile(expert_file, is_expert=True) if expert_file else None
+            source_file = unsmoothed_file
+    except Exception as e:
+        tb_str = traceback.format_exc()
+        msg = f"Erreur lors du chargement des données SWOT pour {task_name}: {e}\n{tb_str}"
+        report_queue.put({'task_name': task_name, 'level': 'ERROR', 'message': msg})
+        return None, None
+
 
     if not main_data or not any(isinstance(ds, xr.Dataset) for ds in (main_data.values() if isinstance(main_data, dict) else [main_data])):
         msg = f"Aucune donnée SWOT n'a pu être chargée pour {task_name}."
@@ -252,18 +260,6 @@ def load_and_process_swot_data(config: dict, cycle: str, pass_id: str, zone_data
     ui_queue.put((pid, "log", f"Traitement SWOT pour le groupe '{display_group_name}' terminé."))
     
     return valid_groups[display_group_name], source_file
-
-def apply_quality_flags(swot_data: xr.Dataset, config: dict) -> xr.Dataset:
-    quality_config = config.get("swot_quality_filter", {})
-    accepted_values = quality_config.get("accepted_values", [0])
-    variable_map = quality_config.get("variable_map", {})
-    filtered_ds = swot_data.copy(deep=True)
-    
-    for data_var, qual_var in variable_map.items():
-        if data_var in filtered_ds and qual_var in filtered_ds:
-            quality_mask = filtered_ds[qual_var].isin(accepted_values)
-            filtered_ds[data_var] = filtered_ds[data_var].where(quality_mask)
-    return filtered_ds
 
 def process_swot_orientation_and_time(swot_data, ui_queue, report_queue, task_name, pid):
     is_hr = is_hr_dataset(swot_data)
