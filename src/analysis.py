@@ -128,11 +128,14 @@ def _create_and_save_netcdf(zone_id, cycle, pass_id, config, swot_data,
         'swot_time_median': swot_time.isoformat() + (' (FALLBACK)' if time_fallback else '')
     })
     
-    downsample = config.get("downsampling", 1)
+    downsample = config.get("downsampling", config.get("rasterization_downsampling_factor", 1))
     target_grid = elevation_roi
     if downsample > 1:
         ui_queue.put((pid, "log", f"Sous-échantillonnage (x{downsample})..."))
+        original_crs = elevation_roi.rio.crs
         target_grid = elevation_roi.coarsen({config["mnt_lon"]: downsample, config["mnt_lat"]: downsample}, boundary="trim").mean()
+        if original_crs is not None:
+            target_grid.rio.write_crs(original_crs, inplace=True)
 
     rasterized_swot = swot_processing.rasterize_swot_data(swot_data, target_grid, config)
     for var_name, data_array in rasterized_swot.items():
@@ -140,7 +143,10 @@ def _create_and_save_netcdf(zone_id, cycle, pass_id, config, swot_data,
 
     output_data['dem_roi'] = target_grid.rename('dem_roi')
     if inundation_map is not None and inundation_map.notnull().any():
+        inund_crs = inundation_map.rio.crs
         inund_downsampled = inundation_map.coarsen({config["mnt_lon"]: downsample, config["mnt_lat"]: downsample}, boundary="trim").max()
+        if inund_crs is not None:
+            inund_downsampled.rio.write_crs(inund_crs, inplace=True)
         output_data['inundation_mask'] = inund_downsampled.rename('inundation_mask')
 
     if output_data.data_vars:
