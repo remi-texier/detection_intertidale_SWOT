@@ -255,5 +255,200 @@
             "lat": 46.2
         },
         "name": "Baie_de_Marene_Oléron"
+    },
+    "zone_10": {
+        "pass_id": [
+            467,
+            536
+        ],
+        "data_group": [
+            "right",
+            "left"
+        ],
+        "tile": [
+            "097F",
+            "058F"
+        ],
+        "extent": {
+            "lon": [
+                91.15,
+                91.67
+            ],
+            "lat": [
+                22.32,
+                22.8
+            ]
+        },
+        "name": "Bay_of_Bengal_Bangladesh_1"
+    },
+    "zone_11": {
+        "pass_id": [
+            467,
+            536
+        ],
+        "data_group": [
+            "left",
+            "right"
+        ],
+        "tile": [
+            "097F",
+            "058F"
+        ],
+        "extent": {
+            "lon": [
+                90.49,
+                91.22
+            ],
+            "lat": [
+                21.8,
+                22.8
+            ]
+        },
+        "name": "Bay_of_Bengal_Bangladesh_2"
+    },
+    "zone_12": {
+        "pass_id": [
+            464
+        ],
+        "data_group": [
+            "left"
+        ],
+        "tile": [
+            "073F"
+        ],
+        "extent": {
+            "lon": [
+                -53.935,
+                -53.86
+            ],
+            "lat": [
+                5.715,
+                5.775
+            ]
+        },
+        "name": "Guyan_awala"
+    },
+    "zone_13": {
+        "pass_id": [
+            158
+        ],
+        "data_group": [
+            "left"
+        ],
+        "tile": [
+            "073F"
+        ],
+        "extent": {
+            "lon": [
+                -52.65,
+                -52.5
+            ],
+            "lat": [
+                5.05,
+                5.18
+            ]
+        },
+        "name": "Guyan_kourou"
+    },
+    "zone_14": {
+        "pass_id": [
+            326
+        ],
+        "data_group": [
+            "left"
+        ],
+        "tile": [
+            "032F"
+        ],
+        "extent": {
+            "lon": [
+                -80.86,
+                -78.53
+            ],
+            "lat": [
+                50.86,
+                52.38
+            ]
+        },
+        "name": "Waskaganish_Canada"
+    },
+    "zone_15": {
+        "pass_id": [
+            57,
+            180,
+            486
+        ],
+        "data_group": [
+            "left",
+            "right",
+            "left"
+        ],
+        "tile": [
+            "125F",
+            "030F",
+            "030F"
+        ],
+        "extent": {
+            "lon": [
+                7.41,
+                9.09
+            ],
+            "lat": [
+                53.25,
+                54.3
+            ]
+        },
+        "name": "Germany_1"
+    },
+    "zone_16": {
+        "pass_id": [
+            57,
+            180
+        ],
+        "data_group": [
+            "left",
+            "right"
+        ],
+        "tile": [
+            "126F",
+            "029F"
+        ],
+        "extent": {
+            "lon": [
+                8.2,
+                9.08
+            ],
+            "lat": [
+                54.24,
+                54.98
+            ]
+        },
+        "name": "Germany_2"
+    },
+    "zone_17": {
+        "pass_id": [
+            53,
+            540
+        ],
+        "data_group": [
+            "right",
+            "right"
+        ],
+        "tile": [
+            "063F",
+            "092F"
+        ],
+        "extent": {
+            "lon": [
+                44.72,
+                45.01
+            ],
+            "lat": [
+                -16.83,
+                -16.14
+            ]
+        },
+        "name": "Madagascar"
     }
+
 }
