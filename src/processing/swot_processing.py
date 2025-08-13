@@ -177,11 +177,38 @@ def load_and_process_swot_data(config: dict, cycle: str, pass_id: str, zone_data
     try:
         if is_hr_data:
             ui_queue.put((pid, "log", "Traitement de données HR."))
-            hr_file = data_loader.get_tiles(config["data_path"], cycle, pass_id, zone_data)
-            if hr_file:
-                ui_queue.put((pid, "log", f"Fichier HR trouvé : {os.path.basename(hr_file)}"))
-                main_data = data_loader.read_swot_datafile(hr_file, is_expert=False)
-                source_file = hr_file
+            tile_files = data_loader.find_hr_tiles(config["data_path"], cycle, pass_id)
+            if not tile_files:
+                msg = f"Aucune tuile HR trouvée pour {task_name}."
+                report_queue.put({'task_name': task_name, 'level': 'ERROR', 'message': msg})
+                return None, None
+            filtered_datasets = []
+            for i, hr_file in enumerate(tile_files):
+                try:
+                    md = data_loader.read_swot_datafile(hr_file, is_expert=False)
+                    if not md or "main" not in md:
+                        continue
+                    ds = md["main"]
+                    ds = clean_swot_dataset_variables(ds, HR100M_VARIABLES)
+                    ds = apply_roi_to_swot_dataset(ds, config.get("analysis_roi_bbox_dict"))
+                    if not isinstance(ds, xr.Dataset) or not (ds.sizes.get('y', 0) > 0 or ds.sizes.get('num_lines', 0) > 0):
+                        continue
+                    ds = apply_quality_flags(ds, config)
+                    if "wse" in ds and "geoid" in ds and "ssh" not in ds:
+                        ds["ssh"] = ds["wse"] + ds["geoid"]
+                    filtered_datasets.append(ds)
+                except Exception as e:
+                    report_queue.put({'task_name': task_name, 'level': 'WARNING', 'message': f"Tuile HR ignorée ({os.path.basename(hr_file)}): {e}"})
+                    continue
+            if not filtered_datasets:
+                msg = f"Aucune donnée SWOT HR valide après cropping/qualité pour {task_name}."
+                report_queue.put({'task_name': task_name, 'level': 'ERROR', 'message': msg})
+                return None, None
+            primary_ds = filtered_datasets[0]
+            if len(filtered_datasets) > 1:
+                primary_ds.attrs['extra_swot_datasets'] = filtered_datasets[1:]
+            source_file = ";".join(os.path.basename(f) for f in tile_files)
+            return primary_ds, source_file
         else:
             ui_queue.put((pid, "log", "Traitement de données LR."))
             expert_file = data_loader.find_swot_files(config["data_path"], cycle, pass_id, "Expert")
@@ -329,6 +356,109 @@ def process_swot_orientation_and_time(swot_data, ui_queue, report_queue, task_na
 
     return swot_data, (swot_time, is_fallback)
 
+def build_target_grid_from_swot(swot_data: xr.Dataset, extent: Dict[str, Any], config: dict) -> xr.DataArray:
+    """
+    Build a regular lon/lat grid (EPSG:4326) using SWOT native resolution and provided extent.
+    The grid spacing is inferred from the median spacing of SWOT coordinates along each axis.
+    Returns an xr.DataArray filled with NaNs with dims (lat, lon), CRS=EPSG:4326.
+    """
+    lon_name = config.get("mnt_lon", "lon")
+    lat_name = config.get("mnt_lat", "lat")
+
+    is_hr = is_hr_dataset(swot_data)
+    lon_src = _normalize_longitude_array(swot_data["longitude"]).values
+    lat_src = swot_data["latitude"].values
+
+    try:
+        if is_hr and "y" in swot_data.dims and "x" in swot_data.dims:
+            ysize, xsize = swot_data.sizes["y"], swot_data.sizes["x"]
+            x_center = max(0, xsize // 2)
+            y_center = max(0, ysize // 2)
+            lat_line = lat_src[:, x_center]
+            lon_line = lon_src[y_center, :]
+        elif ("num_lines" in swot_data.dims) and ("num_pixels" in swot_data.dims):
+            lsize, psize = swot_data.sizes["num_lines"], swot_data.sizes["num_pixels"]
+            p_center = max(0, psize // 2)
+            l_center = max(0, lsize // 2)
+            lat_line = lat_src[:, p_center]
+            lon_line = lon_src[l_center, :]
+        else:
+            # Fallback: flatten and approximate
+            lat_line = lat_src.flatten()
+            lon_line = lon_src.flatten()
+
+        # Compute median step (abs) ignoring NaNs
+        def _median_step(arr):
+            arr_valid = arr[np.isfinite(arr)]
+            if arr_valid.size < 2:
+                return np.nan
+            diffs = np.diff(np.sort(arr_valid))
+            diffs = diffs[np.isfinite(diffs) & (diffs != 0)]
+            return np.nanmedian(np.abs(diffs)) if diffs.size > 0 else np.nan
+
+        dlat = _median_step(lat_line)
+        dlon = _median_step(lon_line)
+
+        # Bounds from extent
+        min_lon, max_lon = sorted(extent.get("lon", [np.nan, np.nan]))
+        min_lat, max_lat = sorted(extent.get("lat", [np.nan, np.nan]))
+        if not all(np.isfinite([min_lon, max_lon, min_lat, max_lat])):
+            raise ValueError("Extent invalide pour construire la grille")
+
+        # If step undefined, infer from span and counts
+        if not np.isfinite(dlat) or dlat <= 0:
+            # approximate number of rows from source if available
+            n_lat = lat_src.shape[0] if lat_src.ndim >= 1 else 256
+            dlat = max((max_lat - min_lat) / max(n_lat - 1, 1), 1e-5)
+        if not np.isfinite(dlon) or dlon <= 0:
+            n_lon = lon_src.shape[-1] if lon_src.ndim >= 1 else 256
+            dlon = max((max_lon - min_lon) / max(n_lon - 1, 1), 1e-5)
+
+        lats = np.arange(min_lat, max_lat + dlat * 0.5, dlat)
+        lons = np.arange(min_lon, max_lon + dlon * 0.5, dlon)
+        if lats.size < 2:
+            lats = np.linspace(min_lat, max_lat, 2)
+        if lons.size < 2:
+            lons = np.linspace(min_lon, max_lon, 2)
+
+        da = xr.DataArray(
+            data=np.full((lats.size, lons.size), np.nan, dtype=float),
+            coords={lat_name: lats, lon_name: lons},
+            dims=(lat_name, lon_name),
+            name="target_grid"
+        )
+        # Set EPSG:4326 and spatial dims
+        da = da.rio.write_crs("EPSG:4326", inplace=True)
+        da = da.rio.set_spatial_dims(x_dim=lon_name, y_dim=lat_name, inplace=True)
+        return da
+    except Exception:
+        log.error("Erreur lors de la construction de la grille SWOT cible", exc_info=True)
+        # Minimal grid as last resort
+        da = xr.DataArray(
+            data=np.full((2, 2), np.nan, dtype=float),
+            coords={lat_name: [extent['lat'][0], extent['lat'][1]], lon_name: [extent['lon'][0], extent['lon'][1]]},
+            dims=(lat_name, lon_name),
+            name="target_grid"
+        )
+        da = da.rio.write_crs("EPSG:4326", inplace=True)
+        da = da.rio.set_spatial_dims(x_dim=lon_name, y_dim=lat_name, inplace=True)
+        return da
+
+def _infer_utm_epsg_from_coords(lons: np.ndarray, lats: np.ndarray) -> Optional[str]:
+    try:
+        lons_valid = lons[np.isfinite(lons)]
+        lats_valid = lats[np.isfinite(lats)]
+        if lons_valid.size == 0 or lats_valid.size == 0:
+            return None
+        lon_med = float(np.median(lons_valid))
+        lat_med = float(np.median(lats_valid))
+        zone = int(np.floor((lon_med + 180) / 6) + 1)
+        zone = max(1, min(60, zone))
+        epsg_num = (32600 if lat_med >= 0 else 32700) + zone
+        return f"EPSG:{epsg_num}"
+    except Exception:
+        return None
+
 def rasterize_swot_data(swot_data: xr.Dataset, target_grid: xr.DataArray, config: dict) -> Dict[str, xr.DataArray]:
     result = {}
     
@@ -338,6 +468,38 @@ def rasterize_swot_data(swot_data: xr.Dataset, target_grid: xr.DataArray, config
     
     src_lons_raw = _normalize_longitude_array(swot_data.longitude).values.flatten()
     src_lats_raw = swot_data.latitude.values.flatten()
+
+    # Inclure d'autres tuiles si présentes (évite traitement par tuile)
+    extra_list = swot_data.attrs.get('extra_swot_datasets')
+    if isinstance(extra_list, list) and extra_list:
+        lons_all = [src_lons_raw]
+        lats_all = [src_lats_raw]
+        sig0_all = []
+        is_hr = is_hr_dataset(swot_data)
+        sig0_name = 'sig0' if is_hr else 'sig0_karin_2'
+        if sig0_name in swot_data:
+            sig0_all.append(swot_data[sig0_name].values.flatten())
+        for extra in extra_list:
+            try:
+                lons_all.append(_normalize_longitude_array(extra.longitude).values.flatten())
+                lats_all.append(extra.latitude.values.flatten())
+                if sig0_name in extra:
+                    sig0_all.append(extra[sig0_name].values.flatten())
+            except Exception:
+                continue
+        src_lons_raw = np.concatenate(lons_all, axis=0)
+        src_lats_raw = np.concatenate(lats_all, axis=0)
+        if sig0_all:
+            swot_data = swot_data.copy()
+            # Concat sig0 for joint filtering; store temporarily in attrs to avoid duplicating arrays in Dataset
+            swot_data.attrs['__multi_sig0__'] = np.concatenate(sig0_all, axis=0)
+
+    # Determine projected CRS to compute distances (prefer source file EPSG, else infer from coords)
+    source_epsg = None
+    if hasattr(swot_data, 'attrs'):
+        source_epsg = swot_data.attrs.get('source_epsg')
+    if not source_epsg:
+        source_epsg = _infer_utm_epsg_from_coords(src_lons_raw, src_lats_raw) or "EPSG:32630"
 
     is_hr = is_hr_dataset(swot_data)
     
@@ -351,25 +513,37 @@ def rasterize_swot_data(swot_data: xr.Dataset, target_grid: xr.DataArray, config
     else:
         vars_to_rasterize = {
             'swot_ssh': {'src_var': 'ssh_karin_2_corrected', 'units': 'm'},
-            'swot_sig0': {'src_var': 'sig0_karin_2', 'units': 'dB'}
+            'swot_sig0': {'src_var': 'sig0_karin_2', 'units': 'linear'}
         }
 
     valid_coords_mask = ~np.isnan(src_lons_raw) & ~np.isnan(src_lats_raw)
+
+    # Threshold on sig0 > 1000 (linear), mask these source samples for all variables
+    sig0_src_name = 'sig0' if is_hr else 'sig0_karin_2'
+    if '__multi_sig0__' in swot_data.attrs:
+        sig0_vals = swot_data.attrs.pop('__multi_sig0__')
+        valid_coords_mask &= ~(np.isfinite(sig0_vals) & (sig0_vals > 1000.0))
+    elif sig0_src_name in swot_data:
+        sig0_vals = swot_data[sig0_src_name].values.flatten()
+        valid_coords_mask &= ~(np.isfinite(sig0_vals) & (sig0_vals > 1000.0))
+    else:
+        log.warning(f"Variable sig0 non trouvée dans le dataset pour le masquage des coordonnées.")
+
     src_lons_valid = src_lons_raw[valid_coords_mask]
     src_lats_valid = src_lats_raw[valid_coords_mask]
 
     if src_lons_valid.size == 0:
-        log.warning("Aucune coordonnée SWOT valide trouvée pour la rastérisation.")
+        log.warning("Aucune coordonnée SWOT valide trouvée pour la rastérisation après filtrage sig0.")
         return {}
     
-    transformer = pyproj.Transformer.from_crs("EPSG:4979", "EPSG:32630", always_xy=True)
+    transformer = pyproj.Transformer.from_crs("EPSG:4326", source_epsg, always_xy=True)
     src_x_proj, src_y_proj = transformer.transform(src_lons_valid, src_lats_valid)
     src_points_proj = np.vstack((src_x_proj, src_y_proj)).T
 
-    log.info(f"Construction de l'arbre de recherche (cKDTree) avec {len(src_points_proj)} points SWOT.")
+    log.info(f"Construction de l'arbre cKDTree avec {len(src_points_proj)} points SWOT (proj: {source_epsg}).")
     kdtree = cKDTree(src_points_proj)
 
-    target_grid_proj = target_grid.rio.reproject("EPSG:32630")
+    target_grid_proj = target_grid.rio.reproject(source_epsg)
     target_x_mesh, target_y_mesh = np.meshgrid(target_grid_proj.x.values, target_grid_proj.y.values, indexing='xy')
     target_points_proj = np.vstack((target_x_mesh.ravel(), target_y_mesh.ravel())).T
     
@@ -383,44 +557,58 @@ def rasterize_swot_data(swot_data: xr.Dataset, target_grid: xr.DataArray, config
     )
     distances_proj_da.rio.write_crs(target_grid_proj.rio.crs, inplace=True)
     
-    log.info("Reprojection du masque de distance pour correspondre à la grille MNT originale...")
+    log.info("Reprojection du masque de distance pour correspondre à la grille cible (EPSG:4326)...")
     distances_matched_da = distances_proj_da.rio.reproject_match(target_grid, resampling=Resampling.bilinear)
 
     max_dist = config.get("interpolation_max_distance", 250)
     distance_mask = distances_matched_da.values <= max_dist
-    log.info(f"Masque final créé. {np.sum(distance_mask) / distance_mask.size * 100:.1f}% de la grille sera conservé (distance < {max_dist}m).")
 
+    # Interpolate each variable using only valid source samples
     for out_name, params in vars_to_rasterize.items():
         src_var = params['src_var']
         if src_var not in swot_data:
             log.warning(f"Variable source '{src_var}' non trouvée dans le dataset, ignorée.")
             continue
-            
-        src_values = swot_data[src_var].values.flatten()
         
-        valid_mask_interp = valid_coords_mask & ~np.isnan(src_values)
+        src_values_full = swot_data[src_var].values.flatten()
+        if isinstance(extra_list, list) and extra_list and src_var in ['ssh', 'sig0']:
+            # Concat en mémoire pour ces deux variables uniquement (limite RAM)
+            extras_flat = []
+            for extra in extra_list:
+                if src_var in extra:
+                    try:
+                        extras_flat.append(extra[src_var].values.flatten())
+                    except Exception:
+                        pass
+            if extras_flat:
+                src_values_full = np.concatenate([src_values_full] + extras_flat, axis=0)
+        src_values = src_values_full[valid_coords_mask]
         
-        if not np.any(valid_mask_interp):
+        points = np.vstack((src_lons_valid, src_lats_valid)).T
+        if src_values.size == 0 or points.size == 0:
             log.warning(f"Aucune donnée valide pour l'interpolation de '{src_var}'.")
             continue
 
         interpolated_full = griddata(
-            points=np.vstack((src_lons_raw[valid_mask_interp], src_lats_raw[valid_mask_interp])).T,
-            values=src_values[valid_mask_interp],
+            points=points,
+            values=src_values,
             xi=(lon_mesh, lat_mesh),
             method='linear'
         )
-        
+
         interpolated_masked = np.where(distance_mask, interpolated_full, np.nan)
-        
-        result[out_name] = xr.DataArray(
-            data=interpolated_masked, 
-            coords=target_grid.coords, 
+        da_out = xr.DataArray(
+            data=interpolated_masked,
+            coords=target_grid.coords,
             dims=target_grid.dims,
-            name=out_name, 
+            name=out_name,
             attrs={'units': params['units']}
         )
-            
+        if target_grid.rio.crs is not None:
+            da_out = da_out.rio.write_crs(target_grid.rio.crs, inplace=True)
+            da_out = da_out.rio.set_spatial_dims(x_dim=config["mnt_lon"], y_dim=config["mnt_lat"], inplace=True)
+        result[out_name] = da_out
+
     return result
 
 def apply_quality_flags(swot_data: xr.Dataset, config: dict) -> xr.Dataset:

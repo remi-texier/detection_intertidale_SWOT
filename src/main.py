@@ -289,9 +289,8 @@ def generate_tasks_from_filesystem(data_path: str, all_zones_info: Dict[str, Any
                     current_config_for_zone["analysis_roi_bbox_dict"] = zone_data["extent"]
                     
                     specific_tide_path = zone_data.get("tide_gauge_filepath")
-                    if not specific_tide_path: 
-                        continue
-                    current_config_for_zone["tide_gauge_filepath"] = os.path.join(app_config.PROJECT_ROOT, specific_tide_path)
+                    if specific_tide_path:
+                        current_config_for_zone["tide_gauge_filepath"] = os.path.join(app_config.PROJECT_ROOT, specific_tide_path)
                     
                     task_args = (zone_id, zone_data, current_config_for_zone, cycle_num, pass_id_num)
                     tasks_to_process.append(task_args)

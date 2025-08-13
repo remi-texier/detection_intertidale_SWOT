@@ -7,6 +7,7 @@ import xarray as xr
 from datetime import datetime
 from typing import Optional
 import logging
+from rasterio.enums import Resampling
 
 from . import data_loader
 from .processing import Litto3D_processing, swot_processing
@@ -15,13 +16,11 @@ from . import config
 
 def _interpolate_water_level(config: dict, swot_time, ui_queue, report_queue, task_name, pid):
     """Interpole le niveau d'eau à partir du marégraphe."""
-    ui_queue.put((pid, "status", f"{task_name} | Interpolation marée..."))
     ui_queue.put((pid, "log", f"Début interpolation niveau d'eau pour SWOT time: {swot_time}"))
     
     tide_file = config.get("tide_gauge_filepath") 
     if not tide_file:
-        msg = "Chemin vers le fichier marégraphique non fourni dans la configuration."
-        report_queue.put({'task_name': task_name, 'level': 'ERROR', 'message': msg})
+        ui_queue.put((pid, "log", "Aucun fichier marégraphique fourni: étape marée ignorée."))
         return None, None
     
     ui_queue.put((pid, "log", f"Lecture fichier marégraphe: {tide_file}"))
@@ -64,7 +63,7 @@ def _interpolate_water_level(config: dict, swot_time, ui_queue, report_queue, ta
     
     if not (min_time <= swot_ts <= max_time): 
         msg = f"Heure SWOT ({swot_ts}) hors de la plage du marégraphe ({min_time} à {max_time})."
-        report_queue.put({'task_name': task_name, 'level': 'ERROR', 'message': msg})
+        report_queue.put({'task_name': task_name, 'level': 'WARNING', 'message': msg})
         return None, None
 
     ui_queue.put((pid, "log", f"SWOT time dans la plage marégraphe ✓"))
@@ -101,13 +100,13 @@ def _interpolate_water_level(config: dict, swot_time, ui_queue, report_queue, ta
         ui_queue.put((pid, "log", f"Source: {water_source}"))
         return water_level, water_source
     else:
-        msg = "Impossible d'interpoler le niveau d'eau à l'heure SWOT. Données manquantes dans le marégraphe."
-        report_queue.put({'task_name': task_name, 'level': 'ERROR', 'message': msg})
+        msg = "Impossible d'interpoler le niveau d'eau à l'heure SWOT."
+        report_queue.put({'task_name': task_name, 'level': 'WARNING', 'message': msg})
         ui_queue.put((pid, "log", f"Échec interpolation: valeur NaN après interpolation"))
         return None, None
 
 def _create_and_save_netcdf(zone_id, cycle, pass_id, config, swot_data, 
-                           elevation_roi, inundation_map, water_level, water_source,
+                           target_grid, elevation_on_grid, inundation_map, water_level, water_source,
                            swot_time, time_fallback, unsmoothed_file, ui_queue, report_queue, task_name, pid):
     """Crée et sauvegarde le fichier NetCDF."""
     ui_queue.put((pid, "status", f"{task_name} | Préparation NetCDF..."))
@@ -123,31 +122,26 @@ def _create_and_save_netcdf(zone_id, cycle, pass_id, config, swot_data,
         'mnt_file_used': os.path.basename(config.get("mnt_filepath", "N/A")),
         'tide_gauge_file_used': os.path.basename(config.get("tide_gauge_filepath", "N/A")),
         'processing_date': datetime.now().isoformat(),
-        'tide_height': f"{water_level:.3f} m",
-        'water_level_source_for_inundation': water_source,
-        'swot_time_median': swot_time.isoformat() + (' (FALLBACK)' if time_fallback else '')
+        'tide_height': f"{water_level:.3f} m" if water_level is not None else 'N/A',
+        'water_level_source_for_inundation': water_source or 'N/A',
+        'swot_time_median': swot_time.isoformat() + (' (FALLBACK)' if time_fallback else ''),
+        'crs': 'EPSG:4326'
     })
-    
-    downsample = config.get("downsampling", config.get("rasterization_downsampling_factor", 1))
-    target_grid = elevation_roi
-    if downsample > 1:
-        ui_queue.put((pid, "log", f"Sous-échantillonnage (x{downsample})..."))
-        original_crs = elevation_roi.rio.crs
-        target_grid = elevation_roi.coarsen({config["mnt_lon"]: downsample, config["mnt_lat"]: downsample}, boundary="trim").mean()
-        if original_crs is not None:
-            target_grid.rio.write_crs(original_crs, inplace=True)
 
+    # Rasterisation SWOT sur la grille cible (EPSG:4326)
     rasterized_swot = swot_processing.rasterize_swot_data(swot_data, target_grid, config)
     for var_name, data_array in rasterized_swot.items():
         output_data[var_name] = data_array
 
-    output_data['dem_roi'] = target_grid.rename('dem_roi')
+    # DEM sur grille SWOT (si présent), sinon on met la grille pour référence
+    if elevation_on_grid is not None:
+        output_data['dem_roi'] = elevation_on_grid.rename('dem_roi')
+    else:
+        output_data['dem_roi'] = target_grid.rename('dem_roi')
+
+    # Masque d'inondation (déjà sur la grille cible si calculé)
     if inundation_map is not None and inundation_map.notnull().any():
-        inund_crs = inundation_map.rio.crs
-        inund_downsampled = inundation_map.coarsen({config["mnt_lon"]: downsample, config["mnt_lat"]: downsample}, boundary="trim").max()
-        if inund_crs is not None:
-            inund_downsampled.rio.write_crs(inund_crs, inplace=True)
-        output_data['inundation_mask'] = inund_downsampled.rename('inundation_mask')
+        output_data['inundation_mask'] = inundation_map.rename('inundation_mask')
 
     if output_data.data_vars:
         try:
@@ -191,22 +185,45 @@ def process_and_save_zone_data(zone_id: str, zone_data: dict, config: dict, cycl
     # 3. Interpolation niveau d'eau
     water_result = _interpolate_water_level(config, swot_time, ui_queue, report_queue, task_name, pid)
     if water_result is None or water_result[0] is None:
-        ui_queue.put((pid, "final", f"[bold red]✗ Erreur marée: {task_name}[/bold red]"))
-        return None
-    water_level, water_source = water_result
+        water_level, water_source = None, None
+    else:
+        water_level, water_source = water_result
 
-    # 4. Chargement MNT
+    # 4. Grille cible depuis SWOT + extent (EPSG:4326)
+    extent = config.get("analysis_roi_bbox_dict") or zone_data.get("extent")
+    if not extent:
+        ui_queue.put((pid, "final", f"[bold red]✗ Extent manquant: {task_name}[/bold red]"))
+        return None
+    target_grid = swot_processing.build_target_grid_from_swot(swot_data, extent, config)
+    ui_queue.put((pid, "log", "Grille cible SWOT (EPSG:4326) construite."))
+
+    # 5. Chargement MNT et calcul d'inondation sur MNT natif (puis adaptation à la grille SWOT)
+    elevation_on_grid = None
+    inundation_on_grid = None
     elevation_roi = Litto3D_processing.load_and_process_dem(config, ui_queue, report_queue, task_name, pid)
-    if elevation_roi is None:
-        ui_queue.put((pid, "final", f"[bold red]✗ Erreur MNT: {task_name}[/bold red]"))
-        return None
+    if elevation_roi is not None and elevation_roi.size > 0:
+        lon_name, lat_name = config.get("mnt_lon", "lon"), config.get("mnt_lat", "lat")
+        if elevation_roi.rio.crs is None:
+            elevation_roi = elevation_roi.rio.write_crs("EPSG:4979", inplace=True)
+        # Calcul de l'inondation uniquement si marée dispo
+        inundation_native = None
+        if water_level is not None:
+            inundation_native = Litto3D_processing.compute_inundation_map(elevation_roi, water_level, config, ui_queue, pid, task_name)
+        # Reprojection des produits vers la grille SWOT (EPSG:4326)
+        elevation_roi = elevation_roi.rio.set_spatial_dims(x_dim=lon_name, y_dim=lat_name, inplace=True)
+        elevation_on_grid = elevation_roi.rio.reproject("EPSG:4326").rio.reproject_match(target_grid, resampling=Resampling.bilinear)
+        if inundation_native is not None:
+            if inundation_native.rio.crs is None:
+                inundation_native = inundation_native.rio.write_crs(elevation_roi.rio.crs, inplace=True)
+            inundation_native = inundation_native.rio.set_spatial_dims(x_dim=lon_name, y_dim=lat_name, inplace=True)
+            inundation_on_grid = inundation_native.rio.reproject("EPSG:4326").rio.reproject_match(target_grid, resampling=Resampling.nearest)
+        ui_queue.put((pid, "log", "MNT adapté à la grille SWOT." + (" Masque d'inondation calculé." if inundation_native is not None else " (Pas de masque: marée absente)")))
+    else:
+        ui_queue.put((pid, "log", "MNT indisponible."))
 
-    # 5. Calcul inondation
-    inundation_map = Litto3D_processing.compute_inundation_map(elevation_roi, water_level, config, ui_queue, pid, task_name)
-
-    # 6. Sauvegarde NetCDF
-    netcdf_path = _create_and_save_netcdf(zone_id, cycle, pass_id, config, swot_data, 
-                                         elevation_roi, inundation_map, water_level, water_source,
+    # 6. Sauvegarde NetCDF (EPSG:4326)
+    netcdf_path = _create_and_save_netcdf(zone_id, cycle, pass_id, config, swot_data,
+                                         target_grid, elevation_on_grid, inundation_on_grid, water_level, water_source,
                                          swot_time, time_fallback, unsmoothed_file, ui_queue, report_queue, task_name, pid)
     
     if netcdf_path is None:

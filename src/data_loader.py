@@ -55,14 +55,15 @@ def find_swot_files(base_path: str, cycle_id: str, pass_id: str, product_type: s
     if product_type == "HR":
         hr_path = os.path.join(base_path, "L2_HR")
         if os.path.exists(hr_path):
-            pattern_start_t = f"SWOT_L2_HR_Raster_100m_UTM30T_N_x_x_x_{cycle_id}_{pass_id}_"
-            pattern_start_u = f"SWOT_L2_HR_Raster_100m_UTM30U_N_x_x_x_{cycle_id}_{pass_id}_"
-
             hr_files = []
             for filename in os.listdir(hr_path):
-                if (filename.startswith(pattern_start_t) or filename.startswith(pattern_start_u)) and filename.endswith(".nc"):
+                if not filename.endswith(".nc"):
+                    continue
+                info = extract_tile_info_from_filename(filename)
+                if not info:
+                    continue
+                if info.get('cycle') == str(cycle_id) and info.get('pass') == str(pass_id):
                     hr_files.append(os.path.join(hr_path, filename))
-            
             if hr_files:
                 log.info(f"Trouvé {len(hr_files)} fichier(s) HR pour cycle {cycle_id}, pass {pass_id}")
                 return hr_files[0]
@@ -83,10 +84,13 @@ def find_hr_tiles(base_path: str, cycle_id: str, pass_id: str) -> List[str]:
     hr_path = os.path.join(base_path, "L2_HR")
     
     if os.path.exists(hr_path):
-        pattern_start_t = f"SWOT_L2_HR_Raster_100m_UTM30T_N_x_x_x_{cycle_id}_{pass_id}_"
-        pattern_start_u = f"SWOT_L2_HR_Raster_100m_UTM30U_N_x_x_x_{cycle_id}_{pass_id}_"
         for filename in os.listdir(hr_path):
-            if (filename.startswith(pattern_start_t) or filename.startswith(pattern_start_u)) and filename.endswith(".nc"):
+            if not filename.endswith('.nc'):
+                continue
+            info = extract_tile_info_from_filename(filename)
+            if not info:
+                continue
+            if info.get('cycle') == str(cycle_id) and info.get('pass') == str(pass_id):
                 hr_files.append(os.path.join(hr_path, filename))
         
         hr_files.sort()
@@ -95,10 +99,13 @@ def find_hr_tiles(base_path: str, cycle_id: str, pass_id: str) -> List[str]:
             log.info(f"Trouvé {len(hr_files)} tuile(s) HR pour cycle {cycle_id}, pass {pass_id}")
             for file in hr_files:
                 basename = os.path.basename(file)
-                parts = basename.split('_')
-                if len(parts) >= 12:
-                    tile = parts[12]  # 037F, 038F, etc.
-                    log.info(f"  Tuile: {tile} - {basename}")
+                info = extract_tile_info_from_filename(basename) or {}
+                tile = info.get('tile')
+                utm = info.get('utm')
+                hemisphere = info.get('hemisphere')
+                epsg = info.get('epsg')
+                if tile:
+                    log.info(f"  Tuile: {tile} | UTM: {utm}_{hemisphere} | CRS: {epsg} - {basename}")
     
     return hr_files
 
@@ -131,24 +138,53 @@ def get_tiles(base_path: str, cycle_id: str, pass_id: str, zone_data: Optional[D
 
 def extract_tile_info_from_filename(filename: str) -> Optional[Dict[str, str]]:
     """
-    Extrait les informations (cycle, pass, tuile) d'un nom de fichier HR.
-    Format: SWOT_L2_HR_Raster_100m_UTM30T_N_x_x_x_{cycle}_{pass}_{tile}_...
+    Extrait les informations (cycle, pass, tuile, UTM zone/bande, hémisphère, EPSG) d'un nom de fichier HR.
+    Format attendu (généralisé):
+      SWOT_L2_HR_Raster_100m_UTM{zone}{band}_{hemisphere}_x_x_x_{cycle}_{pass}_{tile}_...
     """
     basename = os.path.basename(filename)
     parts = basename.split('_')
-    
-    if len(parts) >= 13 and parts[0] == "SWOT" and parts[1] == "L2" and parts[2] == "HR":
+
+    if len(parts) < 13:
+        return None
+    if not (parts[0] == "SWOT" and parts[1] == "L2" and parts[2] == "HR" and parts[3] == "Raster" and parts[4] == "100m"):
+        return None
+    utm_part = parts[5]
+    hemisphere = parts[6] if len(parts) > 6 else None
+    if not (utm_part.startswith("UTM") and hemisphere in ("N", "S")):
+        return None
+    if any(p != 'x' for p in parts[7:10]):
+        return None
+
+    cycle = parts[10]
+    pas = parts[11]
+    tile = parts[12] if len(parts) > 12 else None
+
+    utm_code = utm_part[3:]  # e.g., '30T', '31U'
+    zone_str = ''
+    for ch in utm_code:
+        if ch.isdigit():
+            zone_str += ch
+        else:
+            break
+    epsg = None
+    if zone_str and hemisphere in ("N", "S"):
         try:
-            return {
-                'cycle': parts[10],
-                'pass': parts[11], 
-                'tile': parts[12],
-                'filename': basename
-            }
-        except (IndexError, ValueError):
-            pass
-    
-    return None
+            zone_num = int(zone_str)
+            epsg_num = (32600 if hemisphere == 'N' else 32700) + zone_num
+            epsg = f"EPSG:{epsg_num}"
+        except ValueError:
+            epsg = None
+
+    return {
+        'cycle': cycle,
+        'pass': pas,
+        'tile': tile,
+        'utm': utm_code,
+        'hemisphere': hemisphere,
+        'epsg': epsg,
+        'filename': basename
+    }
 
 def read_swot_datafile(filepath: str, is_expert: bool = False) -> Union[xr.Dataset, Dict[str, xr.Dataset], None]:
     if not os.path.exists(filepath):
@@ -164,6 +200,9 @@ def read_swot_datafile(filepath: str, is_expert: bool = False) -> Union[xr.Datas
         if is_hr_file:
             try:
                 ds = xr.open_dataset(filepath, engine='netcdf4')
+                info = extract_tile_info_from_filename(os.path.basename(filepath))
+                if info and info.get('epsg'):
+                    ds.attrs['source_epsg'] = info['epsg']
                 return {"main": ds}  
             except Exception as e:
                 log.warning(f"Erreur (read_swot_datafile): Impossible de charger le fichier HR {filepath}: {e}")
