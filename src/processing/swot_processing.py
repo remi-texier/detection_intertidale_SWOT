@@ -585,6 +585,16 @@ def rasterize_swot_data(swot_data: xr.Dataset, target_grid: xr.DataArray, config
         src_values = src_values_full[valid_coords_mask]
         
         points = np.vstack((src_lons_valid, src_lats_valid)).T
+
+        # Filtrage spécifique SSH: supprimer les échantillons source > 200 m
+        if out_name == 'swot_ssh':
+            ssh_mask = np.isfinite(src_values) & (src_values <= 200.0)
+            if not np.any(ssh_mask):
+                log.warning("Aucune donnée SSH <= 200 m après filtrage; 'swot_ssh' sera vide.")
+                continue
+            src_values = src_values[ssh_mask]
+            points = points[ssh_mask, :]
+        
         if src_values.size == 0 or points.size == 0:
             log.warning(f"Aucune donnée valide pour l'interpolation de '{src_var}'.")
             continue
@@ -597,6 +607,9 @@ def rasterize_swot_data(swot_data: xr.Dataset, target_grid: xr.DataArray, config
         )
 
         interpolated_masked = np.where(distance_mask, interpolated_full, np.nan)
+        # Appliquer un seuil de 200 m sur les pixels SSH (supprimer > 200 m)
+        if out_name == 'swot_ssh':
+            interpolated_masked = np.where(interpolated_masked <= 200.0, interpolated_masked, np.nan)
         da_out = xr.DataArray(
             data=interpolated_masked,
             coords=target_grid.coords,

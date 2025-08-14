@@ -82,8 +82,8 @@ def load_and_process_dem(config: Dict[str, Any], ui_queue, report_queue, task_na
         logging.error(f"Échec du chargement du MNT pour {task_name}", exc_info=True)
         return None
     if elevation_roi is None or elevation_roi.size == 0:
-        msg = "Le MNT est vide après application de la ROI. La zone est probablement hors de la couverture du MNT."
-        report_queue.put({'task_name': task_name, 'level': 'ERROR', 'message': msg})
+        msg = "Le MNT est vide après application de la ROI."
+        report_queue.put({'task_name': task_name, 'level': 'WARNING', 'message': msg})
         return None
         
     if elevation_roi.rio.crs is None:
